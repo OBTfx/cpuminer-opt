@@ -10,13 +10,10 @@
 # define some local variables
 
 export LOCAL_LIB="$HOME/usr/lib"
-
 export CONFIGURE_ARGS="--with-curl=$LOCAL_LIB/curl --with-crypto=$LOCAL_LIB/openssl --host=x86_64-w64-mingw32"
-
 export MINGW_LIB="/usr/x86_64-w64-mingw32/lib"
-
-export GCC_MINGW_LIB="/usr/lib/gcc/x86_64-w64-mingw32/7.3-win32"
-
+# set correct gcc version
+export GCC_MINGW_LIB="/usr/lib/gcc/x86_64-w64-mingw32/9.3-win32"
 # used by GCC
 export LDFLAGS="-L$LOCAL_LIB/curl/lib/.libs -L$LOCAL_LIB/gmp/.libs -L$LOCAL_LIB/openssl"
 
@@ -43,19 +40,27 @@ cp $LOCAL_LIB/curl/lib/.libs/libcurl-4.dll release/
 
 # Start building...
 
-make distclean || echo clean
+./clean-all.sh || echo clean
 rm -f config.status
 ./autogen.sh || echo done
+CFLAGS="-O3 -march=icelake-client -Wall" ./configure $CONFIGURE_ARGS
+make -j 8
+strip -s cpuminer.exe
+mv cpuminer.exe release/cpuminer-avx512-sha-vaes.exe
+
+make clean || echo clean
+rm -f config.status
 CFLAGS="-O3 -march=znver1 -Wall" ./configure $CONFIGURE_ARGS
-make -j 16
+make -j 8
 strip -s cpuminer.exe
 mv cpuminer.exe release/cpuminer-zen.exe
 
 # mingw won't compile avx512 without -fno-asynchronous-unwind-tables
 make clean || echo clean
 rm -f config.status
-CFLAGS="-O3 -march=skylake-avx512 -Wall -fno-asynchronous-unwind-tables" ./configure $CONFIGURE_ARGS
-make -j 16
+CFLAGS="-O3 -march=skylake-avx512 -Wall" ./configure $CONFIGURE_ARGS
+#CFLAGS="-O3 -march=skylake-avx512 -Wall -fno-asynchronous-unwind-tables" ./configure $CONFIGURE_ARGS
+make -j 8
 strip -s cpuminer.exe
 mv cpuminer.exe release/cpuminer-avx512.exe
 
@@ -63,7 +68,7 @@ make clean || echo clean
 rm -f config.status
 # GCC 9 doesn't include AES in -march=core-avx2
 CFLAGS="-O3 -march=core-avx2 -maes -Wall" ./configure $CONFIGURE_ARGS
-make -j 16
+make -j 8
 strip -s cpuminer.exe
 mv cpuminer.exe release/cpuminer-avx2.exe
 
@@ -71,7 +76,7 @@ make clean || echo clean
 rm -f config.status
 # -march=corei7-avx still includes aes, but just in case
 CFLAGS="-O3 -march=corei7-avx -maes -Wall" ./configure $CONFIGURE_ARGS 
-make -j 16
+make -j 8
 strip -s cpuminer.exe
 mv cpuminer.exe release/cpuminer-avx.exe
 
@@ -80,7 +85,7 @@ make clean || echo clean
 rm -f config.status
 CFLAGS="-O3 -march=westmere -Wall" ./configure $CONFIGURE_ARGS
 #CFLAGS="-O3 -maes -msse4.2 -Wall" ./configure $CONFIGURE_ARGS
-make -j 16
+make -j 8
 strip -s cpuminer.exe
 mv cpuminer.exe release/cpuminer-aes-sse42.exe
 
@@ -102,7 +107,7 @@ mv cpuminer.exe release/cpuminer-aes-sse42.exe
 make clean || echo clean
 rm -f config.status
 CFLAGS="-O3 -msse2 -Wall" ./configure $CONFIGURE_ARGS
-make -j 16
+make -j 8
 strip -s cpuminer.exe
 mv cpuminer.exe release/cpuminer-sse2.exe
 make clean || echo clean
