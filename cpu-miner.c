@@ -2,8 +2,8 @@
  * Copyright 2010 Jeff Garzik
  * Copyright 2012-2014 pooler
  * Copyright 2014 Lucas Jones
- * Copyright 2014 Tanguy Pruvot
- * Copyright 2016 Jay D Dee
+ * Copyright 2014-2016 Tanguy Pruvot
+ * Copyright 2016-2020 Jay D Dee
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -88,7 +88,7 @@ bool opt_protocol = false;
 bool opt_benchmark = false;
 bool opt_redirect = true;
 bool opt_extranonce = true;
-bool want_longpoll = true;
+bool want_longpoll = false;
 bool have_longpoll = false;
 bool have_gbt = true;
 bool allow_getwork = true;
@@ -494,7 +494,7 @@ static bool get_mininginfo( CURL *curl, struct work *work )
 	   	if ( json_is_object( key ) )
 		   	key = json_object_get( key, "proof-of-work" );
 		   if ( json_is_real( key ) )
-			   net_diff = json_real_value( key );
+			   net_diff = work->targetdiff = json_real_value( key );
 	   }
 
       key = json_object_get( res, "networkhashps" );
@@ -563,6 +563,23 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
    json_t *tmp, *txa;
    bool rc = false;
 
+// Segwit BEGIN
+   bool segwit = false;
+   tmp = json_object_get( val, "rules" );
+   if ( tmp && json_is_array( tmp ) )
+   {
+      n = json_array_size( tmp );
+      for ( i = 0; i < n; i++ )
+      {
+         const char *s = json_string_value( json_array_get( tmp, i ) );
+         if ( !s )
+            continue;
+         if ( !strcmp( s, "segwit" ) || !strcmp( s, "!segwit" ) )
+            segwit = true;
+      }
+   }
+// Segwit END
+   
    tmp = json_object_get( val, "mutable" );
    if ( tmp && json_is_array( tmp ) )
    {
@@ -586,7 +603,6 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
       goto out;
    }
    work->height = (int) json_integer_value( tmp );
-   applog( LOG_BLUE, "Current block is %d", work->height );
 
    tmp = json_object_get(val, "version");
    if ( !tmp || !json_is_integer( tmp ) )
@@ -595,7 +611,6 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
       goto out;
    }
    version = (uint32_t) json_integer_value( tmp );
-
    // yescryptr8g uses block version 5 and sapling.
    if ( opt_sapling )
       work->sapling = true;
@@ -721,13 +736,61 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
       cbtx[41] = cbtx_size - 42; /* scriptsig length */
       le32enc( (uint32_t *)( cbtx+cbtx_size ), 0xffffffff ); /* sequence */
       cbtx_size += 4;
-      cbtx[ cbtx_size++ ] = 1; /* out-counter */
+
+// Segwit BEGIN
+      //cbtx[cbtx_size++] = 1; /* out-counter */
+        cbtx[cbtx_size++] = segwit ? 2 : 1; /* out-counter */
+// Segwit END
+
       le32enc( (uint32_t *)( cbtx+cbtx_size) , (uint32_t)cbvalue ); /* value */
       le32enc( (uint32_t *)( cbtx+cbtx_size+4 ), cbvalue >> 32 );
       cbtx_size += 8;
       cbtx[ cbtx_size++ ] = (uint8_t) pk_script_size; /* txout-script length */
       memcpy( cbtx+cbtx_size, pk_script, pk_script_size );
       cbtx_size += (int) pk_script_size;
+
+// Segwit BEGIN
+       if ( segwit )
+       {
+          unsigned char (*wtree)[32] = calloc(tx_count + 2, 32);
+         memset(cbtx+cbtx_size, 0, 8); /* value */
+         cbtx_size += 8;
+         cbtx[cbtx_size++] = 38; /* txout-script length */
+         cbtx[cbtx_size++] = 0x6a; /* txout-script */
+         cbtx[cbtx_size++] = 0x24;
+         cbtx[cbtx_size++] = 0xaa;
+         cbtx[cbtx_size++] = 0x21;
+         cbtx[cbtx_size++] = 0xa9;
+         cbtx[cbtx_size++] = 0xed;
+         for ( i = 0; i < tx_count; i++ )
+         {
+            const json_t *tx = json_array_get( txa, i );
+            const json_t *hash = json_object_get(tx, "hash" );
+            if ( !hash || !hex2bin( wtree[1+i],
+                                    json_string_value( hash ), 32 ) )
+            {
+               applog(LOG_ERR, "JSON invalid transaction hash");
+               free(wtree);
+               goto out;
+            }
+            memrev( wtree[1+i], 32 );
+         }
+         n = tx_count + 1;
+         while ( n > 1 )
+         {
+            if ( n % 2 )
+               memcpy( wtree[n], wtree[n-1], 32 );
+            n = ( n + 1 ) / 2;
+            for ( i = 0; i < n; i++ )
+               sha256d( wtree[i], wtree[2*i], 64 );
+         }
+         memset( wtree[1], 0, 32 );  /* witness reserved value = 0 */
+         sha256d( cbtx+cbtx_size, wtree[0], 64 );
+         cbtx_size += 32;
+         free( wtree );
+      }
+// Segwit END
+
       le32enc( (uint32_t *)( cbtx+cbtx_size ), 0 ); /* lock time */
       cbtx_size += 4;
       coinbase_append = true;
@@ -795,21 +858,43 @@ static bool gbt_work_decode( const json_t *val, struct work *work )
    bin2hex( work->txs + 2*n, cbtx, cbtx_size );
 
    /* generate merkle root */
-   merkle_tree = (uchar(*)[32]) calloc(((1 + tx_count + 1) & ~1), 32);
-   sha256d(merkle_tree[0], cbtx, cbtx_size);
+   merkle_tree = (uchar(*)[32]) calloc( ( (1 + tx_count + 1) & ~1 ), 32 );
+   sha256d( merkle_tree[0], cbtx, cbtx_size );
    for ( i = 0; i < tx_count; i++ )
    {
       tmp = json_array_get( txa, i );
       const char *tx_hex = json_string_value( json_object_get( tmp, "data" ) );
       const int tx_size = tx_hex ? (int) ( strlen( tx_hex ) / 2 ) : 0;
-      unsigned char *tx = (uchar*) malloc( tx_size );
-      if ( !tx_hex || !hex2bin( tx, tx_hex, tx_size ) )
+
+// Segwit BEGIN      
+      if ( segwit )
       {
-         applog( LOG_ERR, "JSON invalid transactions" );
-         free( tx );
-         goto out;
+         const char *txid = json_string_value( json_object_get( tmp, "txid" ) );
+         if ( !txid || !hex2bin( merkle_tree[1 + i], txid, 32 ) )
+         {
+            applog(LOG_ERR, "JSON invalid transaction txid");
+            goto out;
+         }
+         memrev( merkle_tree[1 + i], 32 );
       }
-      sha256d( merkle_tree[1 + i], tx, tx_size );
+      else
+      {
+// Segwit END
+
+         unsigned char *tx = (uchar*) malloc( tx_size );
+         if ( !tx_hex || !hex2bin( tx, tx_hex, tx_size ) )
+         {
+            applog( LOG_ERR, "JSON invalid transactions" );
+            free( tx );
+            goto out;
+         }
+         sha256d( merkle_tree[1 + i], tx, tx_size );
+         free( tx );
+
+// Segwit BEGIN      
+      }
+// Segwit END
+
       if ( !submit_coinbase )
          strcat( work->txs, tx_hex );
    }
@@ -1405,12 +1490,24 @@ const char *getwork_req =
 
 #define GBT_CAPABILITIES "[\"coinbasetxn\", \"coinbasevalue\", \"longpoll\", \"workid\"]"
 
+// Segwit BEGIN
+#define GBT_RULES "[\"segwit\"]"
+static const char *gbt_req =
+   "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+   GBT_CAPABILITIES ", \"rules\": " GBT_RULES "}], \"id\":0}\r\n";
+const char *gbt_lp_req =
+   "{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
+   GBT_CAPABILITIES ", \"rules\": " GBT_RULES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
+
+/*
 static const char *gbt_req =
 	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
 	GBT_CAPABILITIES "}], \"id\":0}\r\n";
 const char *gbt_lp_req =
 	"{\"method\": \"getblocktemplate\", \"params\": [{\"capabilities\": "
 	GBT_CAPABILITIES ", \"longpollid\": \"%s\"}], \"id\":0}\r\n";
+*/
+// Segwit END
 
 static bool get_upstream_work( CURL *curl, struct work *work )
 {
@@ -1468,27 +1565,32 @@ start:
 
    if ( rc ) 
    {
-      if ( opt_protocol )
+      json_decref( val );
+
+      get_mininginfo( curl, work );
+         report_summary_log( false );
+      
+      if ( opt_protocol | opt_debug )
       {
          timeval_subtract( &diff, &tv_end, &tv_start );
-         applog( LOG_DEBUG, "got new work in %.2f ms",
+         applog( LOG_INFO, "%s new work received in %.2f ms",
+              ( have_gbt ? "GBT" : "GetWork" ),
               ( 1000.0 * diff.tv_sec ) + ( 0.001 * diff.tv_usec ) );
       }
-
-      json_decref( val );
-      // store work height in solo
-      get_mininginfo(curl, work);
 
       if ( work->height > last_block_height )
       {
          last_block_height = work->height;
-         applog( LOG_BLUE, "New Block %d, Net Diff %.5g, Target Diff %.5g, Ntime %08x",
-                           work->height, net_diff, work->targetdiff,
-                           bswap_32( work->data[ algo_gate.ntime_index ] ) );
+         last_targetdiff = net_diff;
 
-         if ( !opt_quiet && net_diff && net_hashrate )
+         applog( LOG_BLUE, "New Block %d, Net Diff %.5g, Ntime %08x",
+                                work->height, net_diff,
+                                work->data[ algo_gate.ntime_index ] );
+
+         if ( !opt_quiet && ( net_diff > 0. ) && ( net_hashrate > 0. ) )
          {
             double miner_hr = 0.;
+
             pthread_mutex_lock( &stats_lock );
 
             for ( int i = 0; i < opt_n_threads; i++ )
@@ -1497,7 +1599,7 @@ start:
 
             pthread_mutex_unlock( &stats_lock );
 
-            if ( miner_hr )
+            if ( miner_hr > 0. )
             {
                double net_hr = net_hashrate;
                char net_hr_units[4] = {0};
@@ -1505,20 +1607,21 @@ start:
                char net_ttf[32];
                char miner_ttf[32];
 
-               sprintf_et( net_ttf, ( work->targetdiff * exp32 ) / net_hr );
-               sprintf_et( miner_ttf, ( work->targetdiff * exp32 ) / miner_hr );
+               sprintf_et( net_ttf, ( net_diff * exp32 ) / net_hr );
+               sprintf_et( miner_ttf, ( net_diff * exp32 ) / miner_hr );
                scale_hash_for_display ( &miner_hr, miner_hr_units );
                scale_hash_for_display ( &net_hr, net_hr_units );
                applog2( LOG_INFO,
                         "Miner TTF @ %.2f %sh/s %s, Net TTF @ %.2f %sh/s %s",
-                        miner_hr, miner_hr_units, miner_ttf,
-                        net_hr, net_hr_units, net_ttf );
+                        miner_hr, miner_hr_units, miner_ttf, net_hr,
+                        net_hr_units, net_ttf );
             }
          }
       }  // work->height > last_block_height
       else if ( memcmp( &work->data[1], &g_work.data[1], 32 ) )
-         applog( LOG_BLUE, "New Work, Ntime %08lx",
-                           bswap_32( work->data[ algo_gate.ntime_index ] ) );
+         applog( LOG_BLUE, "New Work: Block %d, Net Diff %.5g, Ntime %08x",
+                                      work->height, net_diff,
+                                      work->data[ algo_gate.ntime_index ] );
    }  // rc
 
    return rc;
@@ -1918,13 +2021,14 @@ static void stratum_gen_work( struct stratum_ctx *sctx, struct work *g_work )
    pthread_mutex_unlock( &stats_lock );
 
    if ( stratum_diff != sctx->job.diff )
-      applog( LOG_BLUE, "New Diff %g, Block %d, Job %s",
+      applog( LOG_BLUE, "New Stratum Diff %g, Block %d, Job %s",
                         sctx->job.diff, sctx->block_height, g_work->job_id );
    else if ( last_block_height != sctx->block_height )
       applog( LOG_BLUE, "New Block %d, Job %s",
                         sctx->block_height, g_work->job_id );
    else if ( g_work->job_id )
-      applog( LOG_BLUE,"New Job %s", g_work->job_id );
+      applog( LOG_BLUE, "New Work: Block %d, Net diff %.5g, Job %s",
+                         sctx->block_height, net_diff, g_work->job_id );
 
    // Update data and calculate new estimates.
    if ( ( stratum_diff != sctx->job.diff )
@@ -1968,10 +2072,8 @@ static void stratum_gen_work( struct stratum_ctx *sctx, struct work *g_work )
                if ( net_diff && net_ttf )
                {
                   double net_hr = net_diff * exp32 / net_ttf;
-//                  char net_ttf_str[32];
                   char net_hr_units[4] = {0};
 
-//                 sprintf_et( net_ttf_str, net_ttf );
                   scale_hash_for_display ( &net_hr, net_hr_units );
                   applog2( LOG_INFO, "Net hash rate (est) %.2f %sh/s",
                                      net_hr, net_hr_units );
@@ -3217,7 +3319,7 @@ static void show_credits()
 {
    printf("\n         **********  "PACKAGE_NAME" "PACKAGE_VERSION"  *********** \n");
    printf("     A CPU miner with multi algo support and optimized for CPUs\n");
-   printf("     with AVX512, SHA and VAES extensions.\n");
+   printf("     with AVX512, SHA and VAES extensions by JayDDee.\n");
    printf("     BTC donation address: 12tdvfF7KmAsihBXQXynT6E6th2c2pByTT\n\n");
 }
 
